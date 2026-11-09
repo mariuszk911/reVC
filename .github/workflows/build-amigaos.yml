@@ -1,0 +1,91 @@
+# reVC AmigaOS 68k build.
+#
+# Set the repository variable PISTORM3D_SDK_URL to the PiStorm3D SDK archive.
+# Only the build-time client SDK is needed (headers and lib/libminigl.a); the
+# runtime minigl.library is not part of the artifact. The build itself runs
+# inside the Bebbo m68k-amigaos-gcc Docker image via ./build.sh.
+#
+# Optional: set the SUBMODULE_TOKEN secret if the submodule repositories are
+# private (the default GITHUB_TOKEN only sees this repository).
+
+name: reVC AmigaOS 68k
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  IMAGE: amigadev/m68k-amigaos-gcc:latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
+
+      - name: Unpack PiStorm3D SDK
+        env:
+          SDK_URL: ${{ vars.PISTORM3D_SDK_URL }}
+        run: |
+          set -euo pipefail
+          [ -n "${SDK_URL:-}" ] || { echo "Set the PISTORM3D_SDK_URL repository variable" >&2; exit 1; }
+
+          curl -fL "$SDK_URL" -o /tmp/pistorm3d.zip
+          rm -rf /tmp/pistorm3d
+          unzip -q /tmp/pistorm3d.zip -d /tmp/pistorm3d
+
+          sdk_src=$(find /tmp/pistorm3d -maxdepth 2 -type d -name SDK -print -quit)
+          [ -n "$sdk_src" ] || { echo "SDK/ not found in the archive" >&2; exit 1; }
+
+          rm -rf sdks/PiStorm3D
+          mkdir -p sdks/PiStorm3D
+          cp -a "$sdk_src" sdks/PiStorm3D/SDK
+
+          test -f sdks/PiStorm3D/SDK/lib/libminigl.a
+          test -f sdks/PiStorm3D/SDK/minigl-shared-library/include/proto/minigl.h
+          test -f sdks/PiStorm3D/SDK/backend/include/v3d_vertex.h
+
+      - name: Build
+        run: ./build.sh --clean --no-stage
+
+      - name: Set artifact name
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short=12 HEAD)"
+          stamp="$(date -u +%Y%m%d-%H%M%S)"
+          echo "ARTIFACT_NAME=reVC-amigaos-${stamp}-${sha}" >> "$GITHUB_ENV"
+
+      # Real output only: the gamefiles directory plus the built executable and
+      # its debug symbol copy. obj/, gen/, build scripts and other intermediates
+      # are excluded. The runtime minigl.library is installed separately in
+      # LIBS: and is not shipped here.
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          mkdir -p dist
+          cp -a gamefiles dist/gamefiles
+          cp -a build/amigaos/reVC-pistorm3d build/amigaos/reVC-pistorm3d.db dist/
+          (cd dist && zip -qr "$GITHUB_WORKSPACE/${ARTIFACT_NAME}.zip" .)
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}.zip
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "${ARTIFACT_NAME}.zip" --clobber
